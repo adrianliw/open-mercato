@@ -3,6 +3,7 @@
   "audit_logs.resource_kind.sales.note": "Notiz",
   "audit_logs.resource_kind.sales.payment": "Zahlung",
   "audit_logs.resource_kind.sales.shipment": "Versand",
+  "common.error": "Ein Fehler ist aufgetreten",
   "customers~sales.nav.group": "Vertrieb",
   "sales.audit.channels.create": "Vertriebskanal erstellen",
   "sales.audit.channels.delete": "Vertriebskanal löschen",

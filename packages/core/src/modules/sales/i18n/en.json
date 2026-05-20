@@ -3,6 +3,7 @@
   "audit_logs.resource_kind.sales.note": "Note",
   "audit_logs.resource_kind.sales.payment": "Payment",
   "audit_logs.resource_kind.sales.shipment": "Shipment",
+  "common.error": "An error occurred",
   "customers~sales.nav.group": "Sales",
   "sales.audit.channels.create": "Create sales channel",
   "sales.audit.channels.delete": "Delete sales channel",
