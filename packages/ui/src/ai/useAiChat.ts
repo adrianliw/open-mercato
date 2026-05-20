@@ -3,6 +3,13 @@
 import * as React from 'react'
 import { createAiAgentTransport } from '@open-mercato/ai-assistant/modules/ai_assistant/lib/agent-transport'
 import { apiFetch } from '../backend/utils/api'
+import type { LoopTracePanelTrace } from './LoopTracePanel'
+import {
+  createAiServerConversation,
+  importAiLocalConversation,
+  loadAiServerTranscript,
+  serverMessageToChatMessage,
+} from './conversation-store'
 
 /**
  * Chat message shape used by {@link AiChat}. Kept intentionally minimal so the
@@ -11,6 +18,7 @@ import { apiFetch } from '../backend/utils/api'
  * shape for `messages`.
  */
 export interface AiChatMessageFile {
+  id?: string
   name: string
   type: string
   previewUrl?: string
@@ -19,6 +27,7 @@ export interface AiChatMessageFile {
 export interface AiChatToolCallSnapshot {
   id: string
   toolName: string
+  caption?: string
   state: 'pending' | 'complete' | 'error'
   input?: unknown
   output?: unknown
@@ -31,6 +40,25 @@ export interface AiChatMessageUiPart {
   pendingActionId?: string
   /** Stable id used as React key when rendering. */
   key: string
+}
+
+/**
+ * Snapshot of a single task in the visible agent task plan
+ * (spec `.ai/specs/2026-05-13-ai-chat-visible-task-plan.md`). Tasks are
+ * streamed as additive `data-agent-task-plan` / `data-agent-task-update`
+ * SSE chunks and rendered above raw tool-call rows in `<AiChat>`.
+ *
+ * `source: 'runtime'` tasks are derived from tool lifecycle events by the
+ * agent runtime. `source: 'agent'` tasks are emitted through the reserved
+ * `meta.update_task_plan` helper and sanitized before they reach the client.
+ */
+export interface AiAgentTaskSnapshot {
+  id: string
+  label: string
+  state: 'pending' | 'running' | 'done' | 'failed' | 'skipped'
+  detail?: string
+  source: 'runtime' | 'agent'
+  toolCallId?: string
 }
 
 export interface AiChatMessage {
@@ -51,6 +79,12 @@ export interface AiChatMessage {
    * the UI-part registry never surfaces.
    */
   uiParts?: AiChatMessageUiPart[]
+  /**
+   * Client-local visible task plan derived from streamed
+   * `data-agent-task-plan` snapshots and `data-agent-task-update` deltas.
+   * Not persisted in any chat storage payload.
+   */
+  taskPlan?: AiAgentTaskSnapshot[]
 }
 
 export interface UseAiChatInput {
@@ -70,6 +104,18 @@ export interface UseAiChatInput {
    * props at any time to reset the conversation.
    */
   conversationId?: string
+  /**
+   * Runtime provider override (4b.2). Forwarded as `?provider=` query param
+   * on every POST to the dispatcher. Undefined/null means use the agent's
+   * configured default (no override sent).
+   */
+  providerOverride?: string | null
+  /**
+   * Runtime model override (4b.2). Forwarded as `?model=` query param
+   * on every POST to the dispatcher. Undefined/null means use the agent's
+   * configured default (no override sent).
+   */
+  modelOverride?: string | null
 }
 
 export interface AiChatErrorEnvelope {
@@ -90,6 +136,15 @@ export interface UseAiChatResult {
    * given mount (Phase 3 WS-D contract with `prepareMutation`).
    */
   conversationId: string
+  /**
+   * Loop trace from the last completed turn. Populated when the dispatcher
+   * emits a `loop-finish` SSE event at the end of the response stream.
+   * `null` until the first turn completes or when the dispatcher does not
+   * emit trace events (non-debug deployments may omit them).
+   *
+   * Phase 4 of spec `2026-04-28-ai-agents-agentic-loop-controls`.
+   */
+  lastLoopTrace: LoopTracePanelTrace | null
   sendMessage: (input: string, files?: AiChatMessageFile[]) => Promise<void>
   cancel: () => void
   reset: () => void
@@ -118,6 +173,7 @@ function makeConversationId(): string {
 }
 
 const SESSION_STORAGE_PREFIX = 'om-ai-chat:'
+const SESSION_IMPORT_MARKER_PREFIX = 'om-ai-chat-imported:'
 const SESSION_STORAGE_VERSION = 1
 const SESSION_UPDATED_EVENT = 'om-ai-chat-session-updated'
 const SESSION_STREAM_STATE_EVENT = 'om-ai-chat-session-stream-state'
@@ -199,19 +255,20 @@ function writePersistedSession(
   if (typeof window === 'undefined') return
   try {
     // Strip transient blob/object preview URLs before persisting (they would
-    // not survive a reload). Self-contained `data:` URLs are kept so image
-    // previews come back unchanged after the chat is reopened — public
-    // attachment URLs are intentionally not used because the LLM provider
-    // cannot reach a localhost origin and we want a single durable shape
-    // that works for both transport and reload.
+    // not survive a reload). Self-contained `data:` URLs and same-origin
+    // attachment thumbnail URLs are durable enough for local fallback storage.
     const messages = session.messages.map((message) => {
       if (!message.files || message.files.length === 0) return message
-      const safeFiles = message.files.map(({ name, type, previewUrl }) => {
+      const safeFiles = message.files.map(({ id, name, type, previewUrl }) => {
         const durable =
-          typeof previewUrl === 'string' && previewUrl.startsWith('data:')
+          typeof previewUrl === 'string' &&
+          (previewUrl.startsWith('data:') ||
+            previewUrl.startsWith('/api/attachments/image/') ||
+            previewUrl.startsWith('/api/attachments/file/'))
             ? previewUrl
             : undefined
-        return durable ? { name, type, previewUrl: durable } : { name, type }
+        const base = id ? { id, name, type } : { name, type }
+        return durable ? { ...base, previewUrl: durable } : base
       })
       return { ...message, files: safeFiles }
     })
@@ -238,7 +295,34 @@ function clearPersistedSession(agent: string, conversationId?: string | null): v
   }
 }
 
-function getTransportEndpoint(agent: string, apiPath?: string): string {
+function getImportMarkerKey(agent: string, conversationId: string): string {
+  return `${SESSION_IMPORT_MARKER_PREFIX}${agent}:${conversationId}`
+}
+
+function hasImportMarker(agent: string, conversationId: string): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return window.localStorage.getItem(getImportMarkerKey(agent, conversationId)) === '1'
+  } catch {
+    return false
+  }
+}
+
+function writeImportMarker(agent: string, conversationId: string): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(getImportMarkerKey(agent, conversationId), '1')
+  } catch {
+    // ignore local marker failures; the server import remains authoritative
+  }
+}
+
+function getTransportEndpoint(
+  agent: string,
+  apiPath?: string,
+  providerOverride?: string | null,
+  modelOverride?: string | null,
+): string {
   // Reuse the transport factory so UI consumers share the dispatcher URL
   // convention with server-side callers (e.g. runAiAgentText / Playwright
   // fixtures). The factory returns a ChatTransport<UI_MESSAGE> whose internal
@@ -252,7 +336,14 @@ function getTransportEndpoint(agent: string, apiPath?: string): string {
   void transport
   const base = apiPath && apiPath.length > 0 ? apiPath : '/api/ai_assistant/ai/chat'
   const separator = base.includes('?') ? '&' : '?'
-  return `${base}${separator}agent=${encodeURIComponent(agent)}`
+  let url = `${base}${separator}agent=${encodeURIComponent(agent)}`
+  if (providerOverride) {
+    url += `&provider=${encodeURIComponent(providerOverride)}`
+  }
+  if (modelOverride) {
+    url += `&model=${encodeURIComponent(modelOverride)}`
+  }
+  return url
 }
 
 interface AssistantBuilderState {
@@ -260,11 +351,78 @@ interface AssistantBuilderState {
   reasoning: string
   reasoningStreaming: boolean
   toolCalls: AiChatToolCallSnapshot[]
+  toolCallCaptions: Record<string, string>
+  internalToolCallIds: string[]
   uiParts: AiChatMessageUiPart[]
+  taskPlan: AiAgentTaskSnapshot[]
 }
 
 function createBuilder(): AssistantBuilderState {
-  return { text: '', reasoning: '', reasoningStreaming: false, toolCalls: [], uiParts: [] }
+  return {
+    text: '',
+    reasoning: '',
+    reasoningStreaming: false,
+    toolCalls: [],
+    toolCallCaptions: {},
+    internalToolCallIds: [],
+    uiParts: [],
+    taskPlan: [],
+  }
+}
+
+const VALID_TASK_STATES: ReadonlySet<AiAgentTaskSnapshot['state']> = new Set([
+  'pending',
+  'running',
+  'done',
+  'failed',
+  'skipped',
+])
+const VALID_TASK_SOURCES: ReadonlySet<AiAgentTaskSnapshot['source']> = new Set(['runtime', 'agent'])
+
+function coerceTaskSnapshot(raw: unknown): AiAgentTaskSnapshot | null {
+  if (!raw || typeof raw !== 'object') return null
+  const value = raw as Record<string, unknown>
+  const id = typeof value.id === 'string' ? value.id.trim() : ''
+  if (!id) return null
+  const label = typeof value.label === 'string' ? value.label : ''
+  if (!label) return null
+  const state = VALID_TASK_STATES.has(value.state as AiAgentTaskSnapshot['state'])
+    ? (value.state as AiAgentTaskSnapshot['state'])
+    : 'pending'
+  const source = VALID_TASK_SOURCES.has(value.source as AiAgentTaskSnapshot['source'])
+    ? (value.source as AiAgentTaskSnapshot['source'])
+    : 'runtime'
+  const detail = typeof value.detail === 'string' && value.detail.length > 0 ? value.detail : undefined
+  const toolCallId =
+    typeof value.toolCallId === 'string' && value.toolCallId.length > 0 ? value.toolCallId : undefined
+  return { id, label, state, source, detail, toolCallId }
+}
+
+const TERMINAL_TASK_STATES: ReadonlySet<AiAgentTaskSnapshot['state']> = new Set([
+  'done',
+  'failed',
+  'skipped',
+])
+
+function mergeTaskSnapshot(
+  current: AiAgentTaskSnapshot[],
+  incoming: AiAgentTaskSnapshot,
+): AiAgentTaskSnapshot[] {
+  const idx = current.findIndex((task) => task.id === incoming.id)
+  if (idx === -1) return [...current, incoming]
+  const prior = current[idx]
+  // Stream ordering safeguard: once a task reaches a terminal state we keep
+  // it terminal so a late "running" event cannot revert it (spec §Risks —
+  // "Stream ordering bugs cause stale statuses").
+  const nextState = TERMINAL_TASK_STATES.has(prior.state) ? prior.state : incoming.state
+  const merged: AiAgentTaskSnapshot = {
+    ...prior,
+    ...incoming,
+    state: nextState,
+  }
+  const next = current.slice()
+  next[idx] = merged
+  return next
 }
 
 /**
@@ -387,6 +545,7 @@ function updateToolCall(
     const next: AiChatToolCallSnapshot = {
       id,
       toolName: patch.toolName ?? 'tool',
+      caption: patch.caption ?? state.toolCallCaptions[id],
       state: patch.state ?? 'pending',
       input: patch.input,
       output: patch.output,
@@ -398,6 +557,7 @@ function updateToolCall(
   const merged: AiChatToolCallSnapshot = {
     ...current,
     toolName: patch.toolName ?? current.toolName,
+    caption: patch.caption ?? current.caption,
     state: patch.state ?? current.state,
     input: patch.input !== undefined ? patch.input : current.input,
     output: patch.output !== undefined ? patch.output : current.output,
@@ -406,6 +566,40 @@ function updateToolCall(
   const nextCalls = state.toolCalls.slice()
   nextCalls[idx] = merged
   return { ...state, toolCalls: nextCalls }
+}
+
+function updateToolCallCaption(
+  state: AssistantBuilderState,
+  toolCallId: string | undefined,
+  caption: string,
+): AssistantBuilderState {
+  if (!toolCallId || !caption) return state
+  const toolCallCaptions = { ...state.toolCallCaptions, [toolCallId]: caption }
+  const idx = state.toolCalls.findIndex((entry) => entry.id === toolCallId)
+  if (idx === -1) return { ...state, toolCallCaptions }
+  const nextCalls = state.toolCalls.slice()
+  nextCalls[idx] = { ...nextCalls[idx], caption }
+  return { ...state, toolCallCaptions, toolCalls: nextCalls }
+}
+
+function displayToolName(toolName: unknown): string | undefined {
+  if (typeof toolName !== 'string') return undefined
+  return toolName.replace(/__/g, '.')
+}
+
+function isInternalTaskPlanTool(toolName: unknown): boolean {
+  return displayToolName(toolName) === 'meta.update_task_plan'
+}
+
+function markInternalToolCall(state: AssistantBuilderState, toolCallId: unknown): AssistantBuilderState {
+  const id = String(toolCallId ?? '')
+  if (!id || state.internalToolCallIds.includes(id)) return state
+  return { ...state, internalToolCallIds: [...state.internalToolCallIds, id] }
+}
+
+function isInternalToolCallId(state: AssistantBuilderState, toolCallId: unknown): boolean {
+  const id = String(toolCallId ?? '')
+  return id.length > 0 && state.internalToolCallIds.includes(id)
 }
 
 function applyChunk(
@@ -430,18 +624,21 @@ function applyChunk(
     case 'reasoning-end':
       return { ...state, reasoningStreaming: false }
     case 'tool-input-start':
+      if (isInternalTaskPlanTool(chunk.toolName)) return markInternalToolCall(state, chunk.toolCallId)
       return updateToolCall(state, String(chunk.toolCallId ?? ''), {
-        toolName: typeof chunk.toolName === 'string' ? chunk.toolName : undefined,
+        toolName: displayToolName(chunk.toolName),
         state: 'pending',
       })
     case 'tool-input-available':
+      if (isInternalTaskPlanTool(chunk.toolName)) return markInternalToolCall(state, chunk.toolCallId)
       return updateToolCall(state, String(chunk.toolCallId ?? ''), {
-        toolName: typeof chunk.toolName === 'string' ? chunk.toolName : undefined,
+        toolName: displayToolName(chunk.toolName),
         input: chunk.input,
         state: 'pending',
       })
     case 'tool-output-available': {
       const toolCallId = String(chunk.toolCallId ?? '')
+      if (isInternalToolCallId(state, toolCallId)) return state
       const next = updateToolCall(state, toolCallId, {
         output: chunk.output,
         state: 'complete',
@@ -465,19 +662,44 @@ function applyChunk(
       return { ...next, uiParts: merged }
     }
     case 'tool-output-error':
+      if (isInternalToolCallId(state, chunk.toolCallId)) return state
       return updateToolCall(state, String(chunk.toolCallId ?? ''), {
         state: 'error',
         errorMessage:
           typeof chunk.errorText === 'string' ? chunk.errorText : 'Tool error',
       })
     case 'tool-input-error':
+      if (isInternalTaskPlanTool(chunk.toolName)) return markInternalToolCall(state, chunk.toolCallId)
       return updateToolCall(state, String(chunk.toolCallId ?? ''), {
-        toolName: typeof chunk.toolName === 'string' ? chunk.toolName : undefined,
+        toolName: displayToolName(chunk.toolName),
         input: chunk.input,
         state: 'error',
         errorMessage:
           typeof chunk.errorText === 'string' ? chunk.errorText : 'Tool error',
       })
+    case 'data-agent-task-plan': {
+      // Initial / replacement plan snapshot. The agent runtime emits this
+      // when the first task in a turn becomes visible. Subsequent
+      // `data-agent-task-update` events patch individual tasks.
+      const rawTasks = Array.isArray(chunk.tasks) ? chunk.tasks : []
+      const coerced = rawTasks
+        .map(coerceTaskSnapshot)
+        .filter((task): task is AiAgentTaskSnapshot => task !== null)
+      if (coerced.length === 0) return state
+      return coerced.reduce(
+        (nextState, task) => updateToolCallCaption(nextState, task.toolCallId, task.label),
+        { ...state, taskPlan: coerced },
+      )
+    }
+    case 'data-agent-task-update': {
+      const incoming = coerceTaskSnapshot(chunk.task)
+      if (!incoming) return state
+      return updateToolCallCaption(
+        { ...state, taskPlan: mergeTaskSnapshot(state.taskPlan, incoming) },
+        incoming.toolCallId,
+        incoming.label,
+      )
+    }
     default:
       return state
   }
@@ -494,6 +716,7 @@ function mergeAssistantMessage(
     reasoningStreaming: state.reasoning ? state.reasoningStreaming : undefined,
     toolCalls: state.toolCalls.length > 0 ? state.toolCalls : undefined,
     uiParts: state.uiParts.length > 0 ? state.uiParts : undefined,
+    taskPlan: state.taskPlan.length > 0 ? state.taskPlan : undefined,
   }
 }
 
@@ -549,7 +772,7 @@ async function readErrorEnvelope(response: Response): Promise<AiChatErrorEnvelop
 }
 
 export function useAiChat(input: UseAiChatInput): UseAiChatResult {
-  const { agent, apiPath, pageContext, attachmentIds, debug, initialMessages, onError, conversationId: conversationIdInput } = input
+  const { agent, apiPath, pageContext, attachmentIds, debug, initialMessages, onError, conversationId: conversationIdInput, providerOverride, modelOverride } = input
 
   // Minted once on mount when the caller does not supply a conversationId.
   // The ref keeps the id stable across re-renders and is reused for every
@@ -610,14 +833,19 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
   // Without this, closing the dock or switching agents while the assistant
   // is "Thinking" abandons the partial reply (issue #1816).
   const latestMessagesRef = React.useRef<AiChatMessage[]>(messages)
+  const latestStatusRef = React.useRef<'idle' | 'submitting' | 'streaming'>(status)
   const persistKeyRef = React.useRef<string | null>(null)
   const agentRef = React.useRef<string>(agent)
+  const pageContextRef = React.useRef<Record<string, unknown> | undefined>(pageContext)
   const effectiveConversationIdRef = React.useRef<string>(effectiveConversationId)
   const sessionStorageKeyRef = React.useRef<string>(sessionStorageKey)
   const mountedRef = React.useRef(true)
   React.useEffect(() => {
     latestMessagesRef.current = messages
   }, [messages])
+  React.useEffect(() => {
+    latestStatusRef.current = status
+  }, [status])
   React.useEffect(() => {
     persistKeyRef.current =
       typeof conversationIdInput === 'string' && conversationIdInput.length > 0
@@ -627,6 +855,9 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
   React.useEffect(() => {
     agentRef.current = agent
   }, [agent])
+  React.useEffect(() => {
+    pageContextRef.current = pageContext
+  }, [pageContext])
   React.useEffect(() => {
     effectiveConversationIdRef.current = effectiveConversationId
   }, [effectiveConversationId])
@@ -682,6 +913,53 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
     [persistSnapshot],
   )
 
+  React.useEffect(() => {
+    let cancelled = false
+    const localCandidate = readPersistedSession(agent, persistKey)
+
+    async function hydrateFromServer(): Promise<void> {
+      const transcript = await loadAiServerTranscript(effectiveConversationId, { limit: 100 })
+      if (cancelled || latestStatusRef.current !== 'idle') return
+
+      if (transcript) {
+        const serverMessages = transcript.messages
+          .map(serverMessageToChatMessage)
+          .filter((message): message is AiChatMessage => message !== null)
+        if (serverMessages.length > 0 || !localCandidate || localCandidate.messages.length === 0) {
+          updateMessages(serverMessages)
+          if (serverMessages.length > 0) persistSnapshot(serverMessages, true)
+          return
+        }
+      }
+
+      if (!localCandidate || localCandidate.messages.length === 0) {
+        if (!transcript) {
+          void createAiServerConversation({
+            agentId: agent,
+            conversationId: effectiveConversationId,
+            pageContext: pageContextRef.current ?? null,
+          })
+        }
+        return
+      }
+
+      if (hasImportMarker(agent, effectiveConversationId)) return
+      const imported = await importAiLocalConversation({
+        agentId: agent,
+        conversationId: effectiveConversationId,
+        pageContext: pageContextRef.current ?? null,
+        messages: localCandidate.messages,
+      })
+      if (cancelled || !imported) return
+      writeImportMarker(agent, effectiveConversationId)
+    }
+
+    void hydrateFromServer()
+    return () => {
+      cancelled = true
+    }
+  }, [agent, effectiveConversationId, persistKey, persistSnapshot, updateMessages])
+
   const setStatus = React.useCallback((next: 'idle' | 'submitting' | 'streaming') => {
     if (mountedRef.current) {
       setStatusInternal(next)
@@ -694,6 +972,8 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
   const [lastResponseDebug, setLastResponseDebug] = React.useState<
     { status: number; text: string } | null
   >(null)
+
+  const [lastLoopTrace, setLastLoopTrace] = React.useState<LoopTracePanelTrace | null>(null)
 
   const abortRef = React.useRef<AbortController | null>(null)
   const onErrorRef = React.useRef(onError)
@@ -728,6 +1008,7 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
     setError(null)
     setLastRequestDebug(null)
     setLastResponseDebug(null)
+    setLastLoopTrace(null)
     clearPersistedSession(agent, persistKey)
     mintedConversationIdRef.current = makeConversationId()
   }, [agent, cancel, persistKey, updateMessages])
@@ -763,11 +1044,14 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
       const controller = new AbortController()
       abortRef.current = controller
 
-      const url = getTransportEndpoint(agent, apiPath)
+      const url = getTransportEndpoint(agent, apiPath, providerOverride, modelOverride)
       const body = {
         messages: outgoingHistory.map((message) => ({
+          id: message.id,
           role: message.role,
           content: message.content,
+          files: message.files,
+          uiParts: message.uiParts,
         })),
         pageContext,
         attachmentIds,
@@ -833,6 +1117,10 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
         return
       }
 
+      // Per-turn loop trace collected from the `loop-finish` SSE event emitted
+      // by the dispatcher at the end of the stream (Phase 4).
+      let pendingLoopTrace: LoopTracePanelTrace | null = null
+
       const headerGet = (name: string): string | null => {
         const headers = (response as { headers?: { get?: (k: string) => string | null } })
           .headers
@@ -862,8 +1150,12 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
           if (!data) continue
           if (data === '[DONE]') continue
           try {
-            const parsed = JSON.parse(data) as { type?: string }
-            if (parsed && typeof parsed.type === 'string') {
+            const parsed = JSON.parse(data) as { type?: string; trace?: unknown }
+            if (!parsed || typeof parsed.type !== 'string') continue
+            if (parsed.type === 'loop-finish') {
+              // Capture the loop trace for post-stream state update.
+              pendingLoopTrace = parsed.trace as LoopTracePanelTrace ?? null
+            } else {
               builder = applyChunk(builder, parsed as { type: string })
             }
           } catch {
@@ -922,6 +1214,9 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
         )
         if (mountedRef.current) {
           setLastResponseDebug({ status: response.status, text: streamedRaw })
+          if (pendingLoopTrace !== null) {
+            setLastLoopTrace(pendingLoopTrace)
+          }
         }
         const isEmpty =
           !builder.text.trim() && builder.toolCalls.length === 0 && !builder.reasoning
@@ -966,18 +1261,7 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
         setStatus('idle')
       }
     },
-    [
-      agent,
-      apiPath,
-      attachmentIds,
-      debug,
-      effectiveConversationId,
-      emitError,
-      pageContext,
-      sessionStorageKey,
-      setStatus,
-      updateMessages,
-    ],
+    [agent, apiPath, attachmentIds, debug, effectiveConversationId, emitError, messages, modelOverride, pageContext, providerOverride],
   )
 
   React.useEffect(() => {
@@ -1034,6 +1318,7 @@ export function useAiChat(input: UseAiChatInput): UseAiChatResult {
     lastRequestDebug,
     lastResponseDebug,
     conversationId: effectiveConversationId,
+    lastLoopTrace,
     sendMessage,
     cancel,
     reset,
