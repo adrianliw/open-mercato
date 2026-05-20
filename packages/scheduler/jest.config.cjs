@@ -20,7 +20,7 @@ module.exports = {
       {
         tsconfig: {
           rootDir: '.',
-          ignoreDeprecations: '6.0',
+          ignoreDeprecations: '5.0',
           esModuleInterop: true,
           allowJs: true,
         },
